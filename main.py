@@ -41,8 +41,9 @@ OFFICIAL_HOSTS = (
 
 STATE_PATH = Path(os.getenv("STATE_FILE", "state.json"))
 TIMEOUT = 25
-MAX_PAGES = max(1, min(int(os.getenv("MAX_PAGES", "5")), 25))
+MAX_PAGES = max(1, min(int(os.getenv("MAX_PAGES", "7")), 25))
 PAGE_SIZE = 1000
+START_SKIP = max(0, int(os.getenv("START_SKIP", "416000")))
 MAX_RESULTS = max(1, min(int(os.getenv("MAX_RESULTS", "8")), 15))
 MAX_SEEN = 5000
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
@@ -190,7 +191,7 @@ def fetch_notices():
             "datasetId": DATASET_ID,
             "resourceId": RESOURCE_ID,
             "top": PAGE_SIZE,
-            "skip": page * PAGE_SIZE,
+            "skip": START_SKIP + page * PAGE_SIZE,
             "type": "json",
         })
 
