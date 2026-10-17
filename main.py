@@ -1,10 +1,10 @@
-
 #!/usr/bin/env python3
 """SolveEase GapHunter: World Bank procurement opportunity discovery.
 
 Source: World Bank Group Procurement Notice dataset.
 Delivery: Telegram.
-Scheduling and persistent state: GitHub Actions + state.json.
+Scheduling and persistent state: GitHub Actions + state.json,
+with an integrated HTTP health/web server for hosting platforms.
 
 A future deadline does not establish applicant eligibility or guarantee
 that a notice remains open. Always check the official notice.
@@ -16,11 +16,13 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -447,12 +449,69 @@ def main():
     write_github_summary(stats, len(selected), errors, False)
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+
+        if path not in ("/", "/healthz"):
+            self.send_error(404, "Not found")
+            return
+
+        body = json.dumps({
+            "service": APP_NAME,
+            "version": VERSION,
+            "status": "ok",
+            "scanner": "background"
+        }).encode("utf-8")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        print("HTTP:", fmt % args)
+
+
+def scanner_loop():
+    interval = max(
+        3600,
+        int(os.getenv("SCAN_INTERVAL_SECONDS", "86400"))
+    )
+
+    while True:
+        try:
+            print("Starting scheduled GapHunter scan...")
+            main()
+        except Exception as exc:
+            print(
+                f"SCAN ERROR: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True
+            )
+
+        print(f"Next scan in {interval} seconds.")
+        time.sleep(interval)
+
+
+def run_web_service():
+    port = int(os.getenv("PORT", "10000"))
+
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", port),
+        HealthHandler
+    )
+
+    worker = threading.Thread(
+        target=scanner_loop,
+        daemon=True
+    )
+    worker.start()
+
+    print(f"{APP_NAME} listening on port {port}", flush=True)
+    server.serve_forever()
+
+
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        print(
-            f"FATAL: {type(exc).__name__}: {exc}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    run_web_service()
