@@ -47,6 +47,8 @@ START_SKIP = max(0, int(os.getenv("START_SKIP", "416000")))
 MAX_RESULTS = max(1, min(int(os.getenv("MAX_RESULTS", "8")), 15))
 MAX_SEEN = 5000
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+AUDIT_MODE = os.getenv("AUDIT_MODE", "false").lower() == "true"
+AUDIT_SAMPLE_SIZE = 20
 
 # Intentional narrow focus: service/consultancy opportunities, not every notice.
 RELEVANCE_TERMS = {
@@ -531,14 +533,121 @@ def write_github_summary(stats, sent_count, errors, dry_run):
         handle.write("\n".join(lines) + "\n")
 
 
+def build_audit_sample(notices, limit=AUDIT_SAMPLE_SIZE):
+    """Choose a repeatable, category-diverse sample for manual review."""
+    groups = {
+        "individual_consultant": [],
+        "firm_consultancy": [],
+        "non_consulting_services": [],
+        "other_matches": [],
+    }
+
+    for item in notices:
+        category = item.get("category", "").lower()
+        method = item.get("method", "").lower()
+        title = item.get("title", "").lower()
+
+        if "individual" in method:
+            group = "individual_consultant"
+        elif (
+            "non-consulting" in category
+            or "non consulting" in category
+        ):
+            group = "non_consulting_services"
+        elif (
+            "consultant" in category
+            or "consultan" in title
+            or "consultancy" in title
+        ):
+            group = "firm_consultancy"
+        else:
+            group = "other_matches"
+
+        groups[group].append(item)
+
+    # Stable ordering makes the sample reproducible.
+    for group in groups.values():
+        group.sort(key=lambda item: item["notice_id"])
+
+    sample = []
+    positions = {name: 0 for name in groups}
+
+    # Take one from each group per round until the sample is full.
+    while len(sample) < limit:
+        added_this_round = False
+
+        for name, group in groups.items():
+            position = positions[name]
+
+            if position < len(group) and len(sample) < limit:
+                sample.append({
+                    **group[position],
+                    "audit_group": name,
+                })
+                positions[name] += 1
+                added_this_round = True
+
+        if not added_this_round:
+            break
+
+    return sample
+
+
+def print_audit_report(notices, stats):
+    """Print a manual-review report without sending Telegram alerts."""
+    sample = build_audit_sample(notices)
+
+    report = {
+        "mode": "AUDIT_ONLY",
+        "app": APP_NAME,
+        "version": VERSION,
+        "generated_at": utc_now(),
+        "scan_stats": stats,
+        "sample_size": len(sample),
+        "instructions": (
+            "Open each official URL and manually verify the notice, "
+            "deadline, opportunity type, eligibility and audience fit. "
+            "These checks have not been performed automatically."
+        ),
+        "sample": [
+            {
+                "audit_group": item["audit_group"],
+                "notice_id": item["notice_id"],
+                "title": item["title"],
+                "url": item["url"],
+                "country": item["country"],
+                "deadline": item["deadline"],
+                "published": item["published"],
+                "category": item["category"],
+                "method": item["method"],
+                "matched_terms": item["matched_terms"],
+                "eligibility_status": "UNVERIFIED",
+                "deadline_status": "REQUIRES_OFFICIAL_CHECK",
+            }
+            for item in sample
+        ],
+    }
+
+    print(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        flush=True,
+    )
+
+
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-    if not DRY_RUN and (not token or not chat_id):
+    if not AUDIT_MODE and not DRY_RUN and (not token or not chat_id):
         raise RuntimeError(
-            "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in GitHub Secrets."
+            "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID "
+            "in the hosting environment."
         )
+
+    if AUDIT_MODE:
+        notices, stats = fetch_notices()
+        print_audit_report(notices, stats)
+        return
 
     state = load_state()
     seen = set(state["seen"])
