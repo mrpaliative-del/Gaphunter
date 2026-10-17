@@ -157,11 +157,33 @@ def request_json(url, attempts=3):
 
 
 def fetch_notices():
-    """Read bounded pages from the official dataset API."""
+    """Fetch bounded pages and report why records do or don't match."""
     today = datetime.now(timezone.utc).date()
     notices = {}
-    pages_read = 0
-    records_read = 0
+
+    stats = {
+        "pages_read": 0,
+        "records_read": 0,
+        "missing_id": 0,
+        "missing_title": 0,
+        "invalid_url": 0,
+        "missing_deadline": 0,
+        "invalid_deadline": 0,
+        "expired_deadline": 0,
+        "future_deadline": 0,
+        "no_keyword_match": 0,
+        "matching_open_deadline_notices": 0,
+        "publication_dates_parsed": 0,
+        "publication_dates_missing_or_invalid": 0,
+        "publication_date_min": None,
+        "publication_date_max": None,
+        "sample_field_names": [],
+        "sample_records": [],
+        "source": API_BASE,
+    }
+
+    publication_dates = []
+    sample_keys_recorded = False
 
     for page in range(MAX_PAGES):
         params = urllib.parse.urlencode({
@@ -171,19 +193,25 @@ def fetch_notices():
             "skip": page * PAGE_SIZE,
             "type": "json",
         })
+
         payload = request_json(f"{API_BASE}?{params}")
 
         if not isinstance(payload, dict):
-            raise RuntimeError("Unexpected API response: expected JSON object")
-
-        records = payload.get("data")
-        if not isinstance(records, list):
             raise RuntimeError(
-                "Unexpected API schema: expected a 'data' list"
+                "Unexpected API response: expected a JSON object"
             )
 
-        pages_read += 1
-        records_read += len(records)
+        records = payload.get("data")
+
+        if not isinstance(records, list):
+            # Don't silently accept an unknown API response structure.
+            raise RuntimeError(
+                "Unexpected API schema. Top-level keys: "
+                + ", ".join(map(str, payload.keys()))[:500]
+            )
+
+        stats["pages_read"] += 1
+        stats["records_read"] += len(records)
 
         if not records:
             break
@@ -192,29 +220,103 @@ def fetch_notices():
             if not isinstance(row, dict):
                 continue
 
+            if not sample_keys_recorded:
+                stats["sample_field_names"] = sorted(
+                    str(key) for key in row.keys()
+                )
+                sample_keys_recorded = True
+
             notice_id = str(row.get("id") or "").strip()
-            title = str(row.get("bid_description") or "").strip()
-            link = official_url(row.get("url"))
+            title = str(
+                row.get("bid_description")
+                or row.get("title")
+                or row.get("description")
+                or ""
+            ).strip()
+
+            published_raw = row.get("publication_date")
+            published_date = parse_date(published_raw)
+
+            if published_date:
+                publication_dates.append(published_date)
+                stats["publication_dates_parsed"] += 1
+            else:
+                stats["publication_dates_missing_or_invalid"] += 1
+
             deadline_raw = row.get("deadline_date")
             deadline = parse_date(deadline_raw)
 
-            # No invented links, no expired leads, no unknown deadlines.
-            if not notice_id or not title or not link or deadline is None:
-                continue
-            if deadline < today:
+            raw_url = row.get("url") or row.get("URL")
+            link = official_url(raw_url)
+
+            # Capture a few anonymized-by-purpose field diagnostics.
+            # These are public notice fields, not user information.
+            if len(stats["sample_records"]) < 3:
+                stats["sample_records"].append({
+                    "id_present": bool(notice_id),
+                    "title_sample": title[:140],
+                    "publication_date": str(
+                        published_raw or ""
+                    )[:40],
+                    "deadline_date": str(
+                        deadline_raw or ""
+                    )[:40],
+                    "url_host": urlparse(
+                        str(raw_url or "")
+                    ).hostname or "",
+                    "category": str(
+                        row.get("procurement_category") or ""
+                    )[:100],
+                    "notice_type": str(
+                        row.get("notice_type") or ""
+                    )[:100],
+                })
+
+            if not notice_id:
+                stats["missing_id"] += 1
                 continue
 
-            category = str(row.get("procurement_category") or "").strip()
-            method = str(row.get("procurement_method") or "").strip()
+            if not title:
+                stats["missing_title"] += 1
+                continue
+
+            if not link:
+                stats["invalid_url"] += 1
+                continue
+
+            if deadline_raw is None or not str(deadline_raw).strip():
+                stats["missing_deadline"] += 1
+                continue
+
+            if deadline is None:
+                stats["invalid_deadline"] += 1
+                continue
+
+            if deadline < today:
+                stats["expired_deadline"] += 1
+                continue
+
+            stats["future_deadline"] += 1
+
+            category = str(
+                row.get("procurement_category") or ""
+            ).strip()
+            method = str(
+                row.get("procurement_method") or ""
+            ).strip()
             sector = str(row.get("sector") or "").strip()
-            searchable = " ".join((title, category, method, sector)).lower()
+
+            searchable = " ".join(
+                (title, category, method, sector)
+            ).lower()
 
             matched_terms = sorted(
-                term for term in RELEVANCE_TERMS if term in searchable
+                term for term in RELEVANCE_TERMS
+                if term in searchable
             )
 
-            # Prefer service/consultancy notices relevant to our audience.
             if not matched_terms:
+                stats["no_keyword_match"] += 1
                 continue
 
             item_id = hashlib.sha256(
@@ -229,10 +331,16 @@ def fetch_notices():
                 "country": str(
                     row.get("country_name") or "Not specified"
                 ).strip()[:120],
-                "region": str(row.get("region") or "").strip()[:120],
+                "region": str(
+                    row.get("region") or ""
+                ).strip()[:120],
                 "deadline": deadline.isoformat(),
-                "published": str(row.get("publication_date") or "").strip()[:40],
-                "notice_type": str(row.get("notice_type") or "").strip()[:100],
+                "published": str(
+                    published_raw or ""
+                ).strip()[:40],
+                "notice_type": str(
+                    row.get("notice_type") or ""
+                ).strip()[:100],
                 "category": category[:160],
                 "method": method[:160],
                 "sector": sector[:160],
@@ -242,18 +350,26 @@ def fetch_notices():
         if len(records) < PAGE_SIZE:
             break
 
-    # Nearest deadlines first; stable ID breaks ties.
+    if publication_dates:
+        stats["publication_date_min"] = min(
+            publication_dates
+        ).isoformat()
+        stats["publication_date_max"] = max(
+            publication_dates
+        ).isoformat()
+
     ranked = sorted(
         notices.values(),
-        key=lambda item: (item["deadline"], item["id"]),
+        key=lambda item: (
+            item["deadline"],
+            item["published"],
+            item["id"],
+        ),
     )
 
-    return ranked, {
-        "pages_read": pages_read,
-        "records_read": records_read,
-        "matching_open_deadline_notices": len(ranked),
-        "source": API_BASE,
-    }
+    stats["matching_open_deadline_notices"] = len(ranked)
+
+    return ranked, stats
 
 
 def load_state():
@@ -339,8 +455,24 @@ def build_messages(items, stats, errors):
     header = (
         f"<b>{APP_NAME} · {VERSION}</b>\n"
         f"World Bank procurement scan · {stamp}\n"
+        f"Pages read: {stats['pages_read']}\n"
         f"Records checked: {stats['records_read']}\n"
-        f"Relevant future-deadline matches: "
+        f"Publication dates parsed: "
+        f"{stats['publication_dates_parsed']}\n"
+        f"Publication dates missing/invalid: "
+        f"{stats['publication_dates_missing_or_invalid']}\n"
+        f"Publication date range in scanned pages: "
+        f"{stats['publication_date_min'] or 'unknown'} to "
+        f"{stats['publication_date_max'] or 'unknown'}\n"
+        f"Missing IDs: {stats['missing_id']}\n"
+        f"Missing titles: {stats['missing_title']}\n"
+        f"Rejected URLs: {stats['invalid_url']}\n"
+        f"Missing deadlines: {stats['missing_deadline']}\n"
+        f"Invalid deadlines: {stats['invalid_deadline']}\n"
+        f"Expired deadlines: {stats['expired_deadline']}\n"
+        f"Future deadlines: {stats['future_deadline']}\n"
+        f"No keyword match: {stats['no_keyword_match']}\n"
+        f"Relevant matches: "
         f"{stats['matching_open_deadline_notices']}\n\n"
     )
 
@@ -437,14 +569,11 @@ def main():
         "status": "success",
         "version": VERSION,
         "completed_at": utc_now(),
-        "pages_read": stats["pages_read"],
-        "records_read": stats["records_read"],
-        "relevant_future_deadline_matches":
-            stats["matching_open_deadline_notices"],
+        **stats,
         "new_notices_sent": len(selected),
         "telegram_messages_sent": len(messages),
         "state_file": str(STATE_PATH),
-    }, indent=2))
+    }, indent=2), flush=True)
 
     write_github_summary(stats, len(selected), errors, False)
 
