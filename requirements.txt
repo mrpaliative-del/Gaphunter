@@ -1,3 +1,2 @@
 SolveEase GapHunter
-
 Uses Python standard-library modules only.
