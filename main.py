@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""SolveEase GapHunter: World Bank procurement opportunity discovery.
+"""SolveEase GapHunter 1.1: World Bank procurement discovery.
 
-Source: World Bank Group Procurement Notice dataset.
-Delivery: Telegram.
-Scheduling and persistent state: GitHub Actions + state.json,
-with an integrated HTTP health/web server for hosting platforms.
+Audit mode is enabled by default. It does not send Telegram alerts
+or read/write state.json. Set AUDIT_MODE=false only after reviewing
+the audit results.
 
-A future deadline does not establish applicant eligibility or guarantee
-that a notice remains open. Always check the official notice.
+A score indicates relevance, not eligibility, award probability,
+contract value, or confirmation that a notice remains open.
+Always verify details on the official notice.
 """
 
 import hashlib
@@ -21,44 +21,50 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date, datetime, timezone
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
 APP_NAME = "SolveEase GapHunter"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 API_BASE = (
     "https://datacatalogapi.worldbank.org/dexapps/fone/api/apiservice"
 )
 DATASET_ID = "DS00979"
 RESOURCE_ID = "RS00909"
-OFFICIAL_HOSTS = (
-    "worldbank.org",
-    "worldbankgroup.org",
-)
+OFFICIAL_HOSTS = ("worldbank.org", "worldbankgroup.org")
 
 STATE_PATH = Path(os.getenv("STATE_FILE", "state.json"))
 TIMEOUT = 25
+
 MAX_PAGES = max(1, min(int(os.getenv("MAX_PAGES", "7")), 25))
 PAGE_SIZE = 1000
 START_SKIP = max(0, int(os.getenv("START_SKIP", "416000")))
 MAX_RESULTS = max(1, min(int(os.getenv("MAX_RESULTS", "8")), 15))
 MAX_SEEN = 5000
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
-AUDIT_MODE = os.getenv("AUDIT_MODE", "false").lower() == "true"
-AUDIT_SAMPLE_SIZE = 20
 
-# Intentional narrow focus: service/consultancy opportunities, not every notice.
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+AUDIT_MODE = os.getenv("AUDIT_MODE", "true").lower() == "true"
+AUDIT_SAMPLE_SIZE = max(
+    1, min(int(os.getenv("AUDIT_SAMPLE_SIZE", "20")), 50)
+)
+
+# Broad discovery terms. They identify records to evaluate; they
+# do not, by themselves, qualify a record for the main service feed.
 RELEVANCE_TERMS = {
-    "consulting", "consultant", "consultancy", "non-consulting services",
-    "training", "capacity building", "software", "information technology",
-    "digital", "website", "web development", "data analysis", "data collection",
-    "research", "translation", "interpretation", "graphic design",
-    "communications", "communication", "evaluation", "monitoring",
-    "audit", "accounting", "financial services", "cybersecurity",
-    "cloud services", "database", "maintenance services", "cleaning services",
+    "consulting", "consultant", "consultancy",
+    "non-consulting services", "non consulting services",
+    "training", "capacity building", "software",
+    "information technology", "digital", "website",
+    "web development", "data analysis", "data collection",
+    "research", "translation", "interpretation",
+    "graphic design", "communications", "communication",
+    "evaluation", "monitoring", "audit", "accounting",
+    "financial services", "cybersecurity", "cloud services",
+    "database", "maintenance services", "cleaning services",
     "logistics services", "transport services", "printing services",
     "media services", "photography", "catering services",
     "security services", "event management", "project management",
@@ -67,12 +73,88 @@ RELEVANCE_TERMS = {
     "supply of computers", "supply of software", "it equipment",
 }
 
+# Specific evidence in the title is worth more than a generic
+# keyword in the sector or category.
+TITLE_SERVICE_TERMS = {
+    "software": 12,
+    "web development": 14,
+    "website": 10,
+    "information technology": 12,
+    "cybersecurity": 14,
+    "cloud services": 12,
+    "database": 9,
+    "data analysis": 12,
+    "data collection": 10,
+    "digital": 8,
+    "training": 9,
+    "capacity building": 9,
+    "translation": 10,
+    "interpretation": 10,
+    "graphic design": 10,
+    "communications": 8,
+    "communication": 8,
+    "research": 8,
+    "evaluation": 8,
+    "monitoring": 7,
+    "audit": 8,
+    "accounting": 8,
+    "consulting": 8,
+    "consultant": 8,
+    "consultancy": 8,
+    "maintenance services": 7,
+    "cleaning services": 7,
+    "logistics services": 7,
+    "transport services": 6,
+    "printing services": 7,
+    "media services": 7,
+    "photography": 7,
+    "event management": 7,
+    "project management": 7,
+    "legal services": 7,
+    "human resources": 7,
+    "financial services": 7,
+    "engineering services": 6,
+    "architecture": 6,
+    "environmental services": 6,
+    "social services": 6,
+}
+
+# These terms suggest a goods/works procurement rather than a
+# service assignment. They lower the score but do not prove
+# that the procurement has no service component.
+GOODS_WORKS_TERMS = (
+    "construction of",
+    "rehabilitation of",
+    "civil works",
+    "hydropower plant",
+    "power plant",
+    "road construction",
+    "bridge construction",
+    "supply and installation of equipment",
+    "procurement of equipment",
+    "spare parts",
+    "vehicles",
+    "heavy machinery",
+    "battery energy storage systems",
+)
+
+SERVICE_CATEGORIES = {
+    "individual_consultant",
+    "firm_consultancy",
+    "non_consulting_services",
+    "other_services",
+}
+MIN_MAIN_FEED_SCORE = max(
+    1, min(int(os.getenv("MIN_MAIN_FEED_SCORE", "25")), 100)
+)
+
+
 def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def parse_date(value):
-    """Parse common source date formats without guessing ambiguous dates."""
+    """Parse known date formats without guessing ambiguous dates."""
     if value is None:
         return None
 
@@ -93,31 +175,33 @@ def parse_date(value):
         except ValueError:
             continue
 
-    # Do not guess between DD/MM/YYYY and MM/DD/YYYY.
     return None
 
 
 def official_url(value):
-    """Only return source URLs hosted on World Bank domains."""
+    """Accept HTTPS links on World Bank domains only."""
     raw = str(value or "").strip()
+
     try:
         parsed = urlparse(raw)
+        host = (parsed.hostname or "").lower()
     except ValueError:
         return ""
 
-    host = (parsed.hostname or "").lower()
     if parsed.scheme != "https" or not host:
         return ""
 
-    if not any(host == domain or host.endswith("." + domain)
-               for domain in OFFICIAL_HOSTS):
+    if not any(
+        host == domain or host.endswith("." + domain)
+        for domain in OFFICIAL_HOSTS
+    ):
         return ""
 
     return raw
 
 
 def request_json(url, attempts=3):
-    """Bounded retry for transient HTTP/network failures."""
+    """Fetch JSON with bounded retries for transient failures."""
     request = urllib.request.Request(
         url,
         headers={
@@ -128,12 +212,15 @@ def request_json(url, attempts=3):
 
     for attempt in range(attempts):
         try:
-            with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            with urllib.request.urlopen(
+                request, timeout=TIMEOUT
+            ) as response:
                 if response.status != 200:
                     raise RuntimeError(
                         f"Unexpected HTTP status {response.status}"
                     )
                 raw = response.read(8_000_000)
+
             return json.loads(raw.decode("utf-8"))
 
         except urllib.error.HTTPError as exc:
@@ -142,14 +229,20 @@ def request_json(url, attempts=3):
                 raise RuntimeError(
                     f"Source returned HTTP {exc.code}"
                 ) from exc
+
             retry_after = exc.headers.get("Retry-After", "")
             try:
                 delay = min(max(int(retry_after), 1), 20)
-            except ValueError:
+            except (TypeError, ValueError):
                 delay = 2 ** attempt
+
             time.sleep(delay)
 
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            json.JSONDecodeError,
+        ) as exc:
             if attempt == attempts - 1:
                 raise RuntimeError(
                     f"Source request failed: {type(exc).__name__}"
@@ -159,8 +252,145 @@ def request_json(url, attempts=3):
     raise RuntimeError("Source request failed after retries")
 
 
+def contains_term(text, term):
+    """Match a phrase without matching it inside unrelated words."""
+    if not text or not term:
+        return False
+
+    pattern = (
+        r"(?<![A-Za-z0-9])"
+        + re.escape(term)
+        + r"(?![A-Za-z0-9])"
+    )
+    return re.search(pattern, text, re.IGNORECASE) is not None
+
+
+def classify_opportunity(category, method, title):
+    """Classify procurement type using source fields, not eligibility."""
+    category = category.lower()
+    method = method.lower()
+    title = title.lower()
+
+    if "individual" in method:
+        return "individual_consultant"
+
+    if (
+        "non-consulting" in category
+        or "non consulting" in category
+    ):
+        return "non_consulting_services"
+
+    if "consultant" in category or "consultan" in title:
+        return "firm_consultancy"
+
+    if "works" in category:
+        return "works"
+
+    if "goods" in category:
+        return "goods"
+
+    if "service" in category:
+        return "other_services"
+
+    return "other_matches"
+
+
+def score_notice(title, category, method, sector, matched_terms):
+    """Return a transparent heuristic score and its evidence."""
+    title_l = title.lower()
+    category_l = category.lower()
+    method_l = method.lower()
+    sector_l = sector.lower()
+
+    score = 0
+    reasons = []
+
+    # Procurement category is useful evidence, but not enough alone.
+    if "consultant" in category_l:
+        score += 25
+        reasons.append("consultant-services category (+25)")
+    elif (
+        "non-consulting" in category_l
+        or "non consulting" in category_l
+    ):
+        score += 22
+        reasons.append("non-consulting-services category (+22)")
+    elif "service" in category_l:
+        score += 12
+        reasons.append("services category (+12)")
+    elif "goods" in category_l:
+        score += 1
+        reasons.append("goods category (+1)")
+    elif "works" in category_l:
+        score -= 18
+        reasons.append("works category (-18)")
+
+    if "individual" in method_l:
+        score += 18
+        reasons.append("individual-consultant method (+18)")
+    elif "consultant" in method_l:
+        score += 10
+        reasons.append("consultant-selection method (+10)")
+
+    title_points = []
+    for term, points in TITLE_SERVICE_TERMS.items():
+        if contains_term(title_l, term):
+            title_points.append((term, points))
+
+    # Cap title evidence so a long title cannot win simply by
+    # repeating several near-synonymous keywords.
+    title_score = min(sum(points for _, points in title_points), 36)
+    if title_score:
+        score += title_score
+        reasons.append(f"specific service terms in title (+{title_score})")
+
+    sector_terms = [
+        term for term in RELEVANCE_TERMS
+        if contains_term(sector_l, term)
+    ]
+    sector_score = min(len(sector_terms) * 3, 12)
+    if sector_score:
+        score += sector_score
+        reasons.append(f"service evidence in sector (+{sector_score})")
+
+    negative_hits = [
+        term for term in GOODS_WORKS_TERMS
+        if contains_term(title_l, term)
+    ]
+    if negative_hits:
+        penalty = min(20, len(negative_hits) * 10)
+        score -= penalty
+        reasons.append(
+            f"goods/works wording (-{penalty}): "
+            + ", ".join(negative_hits[:3])
+        )
+
+    score = max(0, min(score, 100))
+
+    opportunity_type = classify_opportunity(
+        category, method, title
+    )
+
+    if (
+        opportunity_type in SERVICE_CATEGORIES
+        and score >= MIN_MAIN_FEED_SCORE
+    ):
+        decision = "KEEP_MAIN_SERVICE_FEED"
+    elif score >= MIN_MAIN_FEED_SCORE:
+        decision = "SECONDARY_REVIEW"
+    else:
+        decision = "LOW_RELEVANCE_REVIEW"
+
+    return {
+        "relevance_score": score,
+        "score_reasons": reasons,
+        "opportunity_type": opportunity_type,
+        "filter_decision": decision,
+    }
+
+
 def fetch_notices():
-    """Fetch bounded pages and report why records do or don't match."""
+    """Fetch bounded pages, score matches, and report diagnostics."""
     today = datetime.now(timezone.utc).date()
     notices = {}
 
@@ -172,10 +402,14 @@ def fetch_notices():
         "invalid_url": 0,
         "missing_deadline": 0,
         "invalid_deadline": 0,
-        "expired_deadline": 0,
+        "overdue_deadline": 0,
+        "due_today": 0,
         "future_deadline": 0,
         "no_keyword_match": 0,
         "matching_open_deadline_notices": 0,
+        "main_service_candidates": 0,
+        "secondary_review_candidates": 0,
+        "low_relevance_candidates": 0,
         "publication_dates_parsed": 0,
         "publication_dates_missing_or_invalid": 0,
         "publication_date_min": None,
@@ -183,6 +417,12 @@ def fetch_notices():
         "sample_field_names": [],
         "sample_records": [],
         "source": API_BASE,
+        "dataset_id": DATASET_ID,
+        "resource_id": RESOURCE_ID,
+        "start_skip": START_SKIP,
+        "max_pages": MAX_PAGES,
+        "page_size": PAGE_SIZE,
+        "minimum_main_feed_score": MIN_MAIN_FEED_SCORE,
     }
 
     publication_dates = []
@@ -205,9 +445,7 @@ def fetch_notices():
             )
 
         records = payload.get("data")
-
         if not isinstance(records, list):
-            # Don't silently accept an unknown API response structure.
             raise RuntimeError(
                 "Unexpected API schema. Top-level keys: "
                 + ", ".join(map(str, payload.keys()))[:500]
@@ -252,9 +490,14 @@ def fetch_notices():
             raw_url = row.get("url") or row.get("URL")
             link = official_url(raw_url)
 
-            # Capture a few anonymized-by-purpose field diagnostics.
-            # These are public notice fields, not user information.
             if len(stats["sample_records"]) < 3:
+                try:
+                    sample_host = (
+                        urlparse(str(raw_url or "")).hostname or ""
+                    )
+                except ValueError:
+                    sample_host = ""
+
                 stats["sample_records"].append({
                     "id_present": bool(notice_id),
                     "title_sample": title[:140],
@@ -264,9 +507,7 @@ def fetch_notices():
                     "deadline_date": str(
                         deadline_raw or ""
                     )[:40],
-                    "url_host": urlparse(
-                        str(raw_url or "")
-                    ).hostname or "",
+                    "url_host": sample_host,
                     "category": str(
                         row.get("procurement_category") or ""
                     )[:100],
@@ -296,10 +537,12 @@ def fetch_notices():
                 continue
 
             if deadline < today:
-                stats["expired_deadline"] += 1
+                stats["overdue_deadline"] += 1
                 continue
-
-            stats["future_deadline"] += 1
+            elif deadline == today:
+                stats["due_today"] += 1
+            else:
+                stats["future_deadline"] += 1
 
             category = str(
                 row.get("procurement_category") or ""
@@ -315,7 +558,7 @@ def fetch_notices():
 
             matched_terms = sorted(
                 term for term in RELEVANCE_TERMS
-                if term in searchable
+                if contains_term(searchable, term)
             )
 
             if not matched_terms:
@@ -326,7 +569,11 @@ def fetch_notices():
                 f"world-bank:{notice_id}".encode("utf-8")
             ).hexdigest()
 
-            notices[item_id] = {
+            scoring = score_notice(
+                title, category, method, sector, matched_terms
+            )
+
+            item = {
                 "id": item_id,
                 "notice_id": notice_id,
                 "title": title[:500],
@@ -338,6 +585,10 @@ def fetch_notices():
                     row.get("region") or ""
                 ).strip()[:120],
                 "deadline": deadline.isoformat(),
+                "deadline_status": (
+                    "DUE_TODAY" if deadline == today
+                    else "FUTURE_DATE_REQUIRES_CHECK"
+                ),
                 "published": str(
                     published_raw or ""
                 ).strip()[:40],
@@ -347,8 +598,21 @@ def fetch_notices():
                 "category": category[:160],
                 "method": method[:160],
                 "sector": sector[:160],
-                "matched_terms": matched_terms[:5],
+                "matched_terms": matched_terms[:8],
+                **scoring,
+                "eligibility_status": "UNVERIFIED",
+                "official_status": "REQUIRES_OFFICIAL_CHECK",
             }
+
+            notices[item_id] = item
+
+            decision = item["filter_decision"]
+            if decision == "KEEP_MAIN_SERVICE_FEED":
+                stats["main_service_candidates"] += 1
+            elif decision == "SECONDARY_REVIEW":
+                stats["secondary_review_candidates"] += 1
+            else:
+                stats["low_relevance_candidates"] += 1
 
         if len(records) < PAGE_SIZE:
             break
@@ -364,14 +628,14 @@ def fetch_notices():
     ranked = sorted(
         notices.values(),
         key=lambda item: (
+            item["filter_decision"] != "KEEP_MAIN_SERVICE_FEED",
+            -item["relevance_score"],
             item["deadline"],
-            item["published"],
             item["id"],
         ),
     )
 
     stats["matching_open_deadline_notices"] = len(ranked)
-
     return ranked, stats
 
 
@@ -381,10 +645,16 @@ def load_state():
 
     try:
         data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or not isinstance(data.get("seen", []), list):
+        if (
+            not isinstance(data, dict)
+            or not isinstance(data.get("seen", []), list)
+        ):
             raise ValueError("Unexpected state format")
+
         return {
-            "seen": [str(x) for x in data.get("seen", [])][-MAX_SEEN:],
+            "seen": [
+                str(x) for x in data.get("seen", [])
+            ][-MAX_SEEN:],
             "updated_at": data.get("updated_at"),
         }
     except (OSError, json.JSONDecodeError, ValueError) as exc:
@@ -423,7 +693,9 @@ def telegram_send(token, chat_id, text):
     )
 
     with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-        result = json.loads(response.read(1_000_000).decode("utf-8"))
+        result = json.loads(
+            response.read(1_000_000).decode("utf-8")
+        )
 
     if not result.get("ok"):
         raise RuntimeError("Telegram did not accept the message")
@@ -439,66 +711,65 @@ def format_notice(item, number):
     published = html.escape(item["published"] or "Not supplied")
     sector = html.escape(item["sector"] or "Not supplied")
     matched = html.escape(", ".join(item["matched_terms"]))
+    opportunity_type = html.escape(item["opportunity_type"])
+    score = item["relevance_score"]
 
     return (
         f"<b>{number}. <a href=\"{link}\">{title}</a></b>\n"
-        f"Country: {country}\n"
+        f"Relevance score: <b>{score}/100</b>\n"
+        f"Opportunity type: {opportunity_type}\n"
+        f"Country/region: {country}\n"
         f"Deadline: <b>{deadline}</b>\n"
         f"Category: {category}\n"
         f"Method: {method}\n"
         f"Sector: {sector}\n"
         f"Published: {published}\n"
         f"Matched because: {matched}\n"
-        "Status: Source-listed; confirm the notice and your eligibility.\n"
+        "Eligibility/status: unverified; check official notice.\n"
     )
 
 
 def build_messages(items, stats, errors):
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
     header = (
         f"<b>{APP_NAME} · {VERSION}</b>\n"
         f"World Bank procurement scan · {stamp}\n"
         f"Pages read: {stats['pages_read']}\n"
         f"Records checked: {stats['records_read']}\n"
-        f"Publication dates parsed: "
-        f"{stats['publication_dates_parsed']}\n"
-        f"Publication dates missing/invalid: "
-        f"{stats['publication_dates_missing_or_invalid']}\n"
-        f"Publication date range in scanned pages: "
-        f"{stats['publication_date_min'] or 'unknown'} to "
-        f"{stats['publication_date_max'] or 'unknown'}\n"
-        f"Missing IDs: {stats['missing_id']}\n"
-        f"Missing titles: {stats['missing_title']}\n"
-        f"Rejected URLs: {stats['invalid_url']}\n"
-        f"Missing deadlines: {stats['missing_deadline']}\n"
-        f"Invalid deadlines: {stats['invalid_deadline']}\n"
-        f"Expired deadlines: {stats['expired_deadline']}\n"
-        f"Future deadlines: {stats['future_deadline']}\n"
-        f"No keyword match: {stats['no_keyword_match']}\n"
-        f"Relevant matches: "
-        f"{stats['matching_open_deadline_notices']}\n\n"
+        f"Overdue excluded: {stats['overdue_deadline']}\n"
+        f"Due today: {stats['due_today']}\n"
+        f"Future dates: {stats['future_deadline']}\n"
+        f"Keyword matches: {stats['matching_open_deadline_notices']}\n"
+        f"Main service candidates: {stats['main_service_candidates']}\n"
+        f"Secondary review: {stats['secondary_review_candidates']}\n"
+        f"Low relevance: {stats['low_relevance_candidates']}\n"
+        "Eligibility: not independently verified\n\n"
     )
 
     if not items:
-        body = (
-            "No new matching notices with parseable future deadlines "
-            "were found in the pages checked."
-        )
-        messages = [header + body]
+        messages = [header + (
+            "No new candidates passed the main service-feed filter."
+        )]
     else:
         messages = []
         current = header
+
         for index, item in enumerate(items, 1):
             block = format_notice(item, index)
-            if len(current) + len(block) > 3600 and current != header:
+            if len(current) + len(block) > 3500 and current != header:
                 messages.append(current)
                 current = header
             current += block + "\n"
+
         if current.strip():
             messages.append(current)
 
     if errors:
-        warning = "\n<b>Warnings</b>\n" + html.escape("; ".join(errors)[:500])
+        warning = (
+            "\n<b>Warnings</b>\n"
+            + html.escape("; ".join(errors)[:500])
+        )
         if len(messages[-1]) + len(warning) < 3900:
             messages[-1] += warning
 
@@ -510,7 +781,11 @@ def write_github_summary(stats, sent_count, errors, dry_run):
     if not path:
         return
 
-    status = "DRY RUN — no Telegram message sent" if dry_run else "Completed"
+    status = (
+        "DRY RUN — no Telegram message sent"
+        if dry_run else "Completed"
+    )
+
     lines = [
         f"# {APP_NAME} run report",
         "",
@@ -518,13 +793,15 @@ def write_github_summary(stats, sent_count, errors, dry_run):
         f"- UTC time: {utc_now()}",
         f"- API pages read: {stats['pages_read']}",
         f"- Records read: {stats['records_read']}",
-        f"- Relevant notices with future deadlines: "
-        f"{stats['matching_open_deadline_notices']}",
+        f"- Keyword matches: {stats['matching_open_deadline_notices']}",
+        f"- Main service candidates: {stats['main_service_candidates']}",
+        f"- Secondary review: {stats['secondary_review_candidates']}",
+        f"- Low relevance: {stats['low_relevance_candidates']}",
         f"- New notices selected: {sent_count}",
         "- Eligibility: not independently verified",
-        "- Deadline status: future date in dataset; check official notice",
         "",
     ]
+
     if errors:
         lines.extend(["## Warnings", ""])
         lines.extend(f"- {error}" for error in errors)
@@ -534,67 +811,55 @@ def write_github_summary(stats, sent_count, errors, dry_run):
 
 
 def build_audit_sample(notices, limit=AUDIT_SAMPLE_SIZE):
-    """Choose a repeatable, category-diverse sample for manual review."""
-    groups = {
-        "individual_consultant": [],
-        "firm_consultancy": [],
-        "non_consulting_services": [],
-        "other_matches": [],
-    }
+    """Build a repeatable sample covering types and filter decisions."""
+    groups = defaultdict(list)
 
     for item in notices:
-        category = item.get("category", "").lower()
-        method = item.get("method", "").lower()
-        title = item.get("title", "").lower()
+        key = (
+            item.get("filter_decision", "UNKNOWN"),
+            item.get("opportunity_type", "other_matches"),
+        )
+        groups[key].append(item)
 
-        if "individual" in method:
-            group = "individual_consultant"
-        elif (
-            "non-consulting" in category
-            or "non consulting" in category
-        ):
-            group = "non_consulting_services"
-        elif (
-            "consultant" in category
-            or "consultan" in title
-            or "consultancy" in title
-        ):
-            group = "firm_consultancy"
-        else:
-            group = "other_matches"
-
-        groups[group].append(item)
-
-    # Stable ordering makes the sample reproducible.
     for group in groups.values():
-        group.sort(key=lambda item: item["notice_id"])
+        group.sort(
+            key=lambda item: (
+                -item["relevance_score"],
+                item["deadline"],
+                item["notice_id"],
+            )
+        )
 
+    keys = sorted(groups)
     sample = []
-    positions = {name: 0 for name in groups}
+    positions = {key: 0 for key in keys}
 
-    # Take one from each group per round until the sample is full.
     while len(sample) < limit:
-        added_this_round = False
+        added = False
 
-        for name, group in groups.items():
-            position = positions[name]
+        for key in keys:
+            position = positions[key]
+            group = groups[key]
 
             if position < len(group) and len(sample) < limit:
+                item = group[position]
                 sample.append({
-                    **group[position],
-                    "audit_group": name,
+                    **item,
+                    "audit_group": (
+                        f"{key[0]}:{key[1]}"
+                    ),
                 })
-                positions[name] += 1
-                added_this_round = True
+                positions[key] += 1
+                added = True
 
-        if not added_this_round:
+        if not added:
             break
 
     return sample
 
 
 def print_audit_report(notices, stats):
-    """Print a manual-review report without sending Telegram alerts."""
+    """Print audit JSON only; do not send Telegram or update state."""
     sample = build_audit_sample(notices)
 
     report = {
@@ -602,12 +867,13 @@ def print_audit_report(notices, stats):
         "app": APP_NAME,
         "version": VERSION,
         "generated_at": utc_now(),
+        "threshold": MIN_MAIN_FEED_SCORE,
         "scan_stats": stats,
         "sample_size": len(sample),
         "instructions": (
-            "Open each official URL and manually verify the notice, "
-            "deadline, opportunity type, eligibility and audience fit. "
-            "These checks have not been performed automatically."
+            "Review official notices manually. Scores are heuristic "
+            "relevance estimates, not eligibility or availability checks. "
+            "Audit mode does not send Telegram or modify state.json."
         ),
         "sample": [
             {
@@ -617,12 +883,17 @@ def print_audit_report(notices, stats):
                 "url": item["url"],
                 "country": item["country"],
                 "deadline": item["deadline"],
+                "deadline_status": item["deadline_status"],
                 "published": item["published"],
                 "category": item["category"],
                 "method": item["method"],
+                "opportunity_type": item["opportunity_type"],
+                "relevance_score": item["relevance_score"],
+                "score_reasons": item["score_reasons"],
+                "filter_decision": item["filter_decision"],
                 "matched_terms": item["matched_terms"],
                 "eligibility_status": "UNVERIFIED",
-                "deadline_status": "REQUIRES_OFFICIAL_CHECK",
+                "official_status": "REQUIRES_OFFICIAL_CHECK",
             }
             for item in sample
         ],
@@ -635,38 +906,53 @@ def print_audit_report(notices, stats):
 
 
 def main():
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-    if not AUDIT_MODE and not DRY_RUN and (not token or not chat_id):
-        raise RuntimeError(
-            "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID "
-            "in the hosting environment."
-        )
-
+    # Audit mode intentionally exits before reading state or Telegram
+    # credentials. It cannot send alerts or mark notices as seen.
     if AUDIT_MODE:
         notices, stats = fetch_notices()
         print_audit_report(notices, stats)
         return
+
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+    if not DRY_RUN and (not token or not chat_id):
+        raise RuntimeError(
+            "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID "
+            "in the Render environment."
+        )
 
     state = load_state()
     seen = set(state["seen"])
     errors = []
 
     notices, stats = fetch_notices()
-    new_items = [item for item in notices if item["id"] not in seen]
-    selected = new_items[:MAX_RESULTS]
 
+    # Only high-enough-scoring service categories enter the main feed.
+    # Goods, works and lower-confidence matches remain available in audit.
+    main_candidates = [
+        item for item in notices
+        if item["filter_decision"] == "KEEP_MAIN_SERVICE_FEED"
+    ]
+
+    new_items = [
+        item for item in main_candidates if item["id"] not in seen
+    ]
+    selected = new_items[:MAX_RESULTS]
     messages = build_messages(selected, stats, errors)
 
     if DRY_RUN:
-        print("DRY RUN: Telegram delivery and state updates are disabled.")
+        print(
+            "DRY RUN: Telegram delivery and state updates are disabled.",
+            flush=True,
+        )
         for item in selected:
             print(json.dumps(item, ensure_ascii=False))
         write_github_summary(stats, len(selected), errors, True)
         return
 
-    # Send before saving IDs. A failure won't silently mark unsent leads seen.
+    # Send before saving IDs. A delivery failure won't silently mark
+    # unsent opportunities as seen.
     for message in messages:
         telegram_send(token, chat_id, message)
         time.sleep(0.4)
@@ -700,7 +986,8 @@ class HealthHandler(BaseHTTPRequestHandler):
             "service": APP_NAME,
             "version": VERSION,
             "status": "ok",
-            "scanner": "background"
+            "scanner": "background",
+            "mode": "audit" if AUDIT_MODE else "live",
         }).encode("utf-8")
 
         self.send_response(200)
@@ -716,21 +1003,25 @@ class HealthHandler(BaseHTTPRequestHandler):
 def scanner_loop():
     interval = max(
         3600,
-        int(os.getenv("SCAN_INTERVAL_SECONDS", "86400"))
+        int(os.getenv("SCAN_INTERVAL_SECONDS", "86400")),
     )
 
     while True:
         try:
-            print("Starting scheduled GapHunter scan...")
+            print(
+                f"Starting scheduled GapHunter scan; "
+                f"mode={'audit' if AUDIT_MODE else 'live'}...",
+                flush=True,
+            )
             main()
         except Exception as exc:
             print(
                 f"SCAN ERROR: {type(exc).__name__}: {exc}",
                 file=sys.stderr,
-                flush=True
+                flush=True,
             )
 
-        print(f"Next scan in {interval} seconds.")
+        print(f"Next scan in {interval} seconds.", flush=True)
         time.sleep(interval)
 
 
@@ -739,16 +1030,19 @@ def run_web_service():
 
     server = ThreadingHTTPServer(
         ("0.0.0.0", port),
-        HealthHandler
+        HealthHandler,
     )
 
     worker = threading.Thread(
         target=scanner_loop,
-        daemon=True
+        daemon=True,
     )
     worker.start()
 
-    print(f"{APP_NAME} listening on port {port}", flush=True)
+    print(
+        f"{APP_NAME} {VERSION} listening on port {port}",
+        flush=True,
+    )
     server.serve_forever()
 
 
