@@ -1,0 +1,74 @@
+
+name: SolveEase GapHunter
+
+on:
+  schedule:
+    - cron: "17 8 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Validate source ingestion without sending Telegram messages"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: solveease-gaphunter
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate Python syntax
+        run: python -m py_compile main.py
+
+      - name: Scan public opportunities
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+          MAX_PAGES: "5"
+          MAX_RESULTS: "8"
+        run: python main.py
+
+      - name: Persist scanner state
+        if: success() && github.event_name != 'workflow_dispatch'
+        run: |
+          git config user.name "SolveEase GapHunter Bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update GapHunter discovery state"
+            git push
+          else
+            echo "No state changes to save."
+          fi
+
+      - name: Persist state after a successful live manual run
+        if: success() && github.event_name == 'workflow_dispatch' && inputs.dry_run == false
+        run: |
+          git config user.name "SolveEase GapHunter Bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update GapHunter discovery state"
+            git push
+          else
+            echo "No state changes to save."
+          fi
